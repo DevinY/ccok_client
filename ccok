@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""本機／Colab 連上 ccok 通道。
+
+./ccok 8818
+./ccok gpu
+./ccok auth line 8188
+./ccok Ab3k9q 8088
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import struct
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+ENV_PATH = ROOT / ".env"
+# 官方通道；自架者可在 .env 覆寫 CCOK_SERVER
+DEFAULT_SERVER = "220.134.172.98:17421"
+DEFAULT_AUTH_URL = "https://ccok.ccc.tc"
+MAX_FRAME = 1024 * 1024
+HEADER = struct.Struct("!BII")
+TYPE_OPEN = 1
+TYPE_DATA = 2
+TYPE_CLOSE = 3
+TYPE_PING = 4
+TYPE_PONG = 5
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text().splitlines():
+        text = line.strip()
+        if text == "" or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def env_or_dotenv(key: str, default: str = "") -> str:
+    value = os.environ.get(key, "").strip()
+    if value != "":
+        return value
+    return dotenv(ENV_PATH).get(key, default).strip()
+
+
+def save_token(token: str) -> None:
+    lines: list[str] = []
+    found = False
+    if ENV_PATH.is_file():
+        for line in ENV_PATH.read_text().splitlines():
+            if line.strip().startswith("CCOK_TOKEN="):
+                lines.append(f"CCOK_TOKEN={token}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"CCOK_TOKEN={token}")
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+    ENV_PATH.chmod(0o600)
+
+
+def load_token() -> str:
+    env = os.environ.get("CCOK_TOKEN", "").strip()
+    if env != "":
+        return env
+    token = dotenv(ENV_PATH).get("CCOK_TOKEN", "").strip()
+    if token != "":
+        return token
+    if not sys.stdin.isatty():
+        raise SystemExit("把 MCP 金鑰寫進 .env 的 CCOK_TOKEN")
+    token = input("MCP 金鑰: ").strip()
+    if token == "":
+        raise SystemExit("沒有金鑰")
+    save_token(token)
+    return token
+
+
+def http_json(method: str, url: str, payload: dict | None = None, timeout: float = 30) -> tuple[int, dict | None]:
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            body = json.loads(raw.decode()) if raw else None
+            return resp.status, body
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            body = json.loads(raw.decode()) if raw else None
+        except json.JSONDecodeError:
+            body = {"error": raw.decode("utf-8", "replace")}
+        return error.code, body
+
+
+def parse(argv: list[str]) -> tuple[str, int, str]:
+    """回傳 (mode, port, pair_code)。pair_code 僅 mode=pair 有值。"""
+    if len(argv) == 0:
+        return "open", 8189, ""
+    if argv == ["gpu"]:
+        return "gpu", 8189, ""
+    if argv[0] == "auth":
+        if len(argv) == 1 or argv[1] != "line":
+            raise SystemExit("用法: ./ccok auth line [8188]")
+        port = 8188
+        if len(argv) >= 3:
+            if not argv[2].isdigit():
+                raise SystemExit("upstream 埠要是數字")
+            port = int(argv[2])
+        return "auth_line", port, ""
+    if len(argv) == 1 and argv[0].isdigit():
+        port = int(argv[0])
+        if not 1 <= port <= 65535:
+            raise SystemExit("埠要在 1 到 65535")
+        return "open", port, ""
+    if len(argv) >= 1 and argv[0].isalnum() and not argv[0].isdigit() and argv[0] not in {"gpu", "open", "auth"}:
+        port = 8189
+        if len(argv) >= 2:
+            if not argv[1].isdigit():
+                raise SystemExit("用法: ./ccok <連線碼> [埠]")
+            port = int(argv[1])
+        return "pair", port, argv[0]
+    raise SystemExit("用法: ./ccok 8818 | ./ccok gpu | ./ccok auth line 8188 | ./ccok <連線碼> [埠]")
+
+
+async def send(writer: asyncio.StreamWriter, lock: asyncio.Lock, kind: int, stream_id: int, payload: bytes = b"") -> None:
+    async with lock:
+        writer.write(HEADER.pack(kind, stream_id, len(payload)) + payload)
+        await writer.drain()
+
+
+async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
+    head = await reader.readexactly(HEADER.size)
+    kind, stream_id, length = HEADER.unpack(head)
+    if length > MAX_FRAME:
+        raise ValueError("frame too large")
+    payload = await reader.readexactly(length) if length else b""
+    return kind, stream_id, payload
+
+
+async def connect(server: str, role: str, token: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    host, _, port_text = server.rpartition(":")
+    reader, writer = await asyncio.open_connection(host, int(port_text))
+    writer.write(f"CCOK 1\nROLE {role}\nAUTH {token}\n\n".encode())
+    await writer.drain()
+    line = await asyncio.wait_for(reader.readline(), timeout=20)
+    if not line.startswith(b"OK "):
+        raise ConnectionError(line.decode("utf-8", "replace").strip() or "auth failed")
+    return reader, writer
+
+
+class Inbox:
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+
+async def run_gpu(server: str, token: str, upstream: str) -> None:
+    up_host, _, up_port = upstream.rpartition(":")
+    while True:
+        try:
+            await gpu_session(server, token, up_host, int(up_port))
+        except Exception as error:
+            log(f"gpu retry {type(error).__name__}: {error}")
+        await asyncio.sleep(3)
+
+
+async def gpu_session(server: str, token: str, up_host: str, up_port: int) -> None:
+    reader, writer = await connect(server, "gpu", token)
+    lock = asyncio.Lock()
+    streams: dict[int, Inbox] = {}
+    log(f"gpu up -> {up_host}:{up_port}")
+
+    async def relay(stream_id: int) -> None:
+        inbox = streams[stream_id]
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(up_host, up_port)
+        except Exception as error:
+            log(f"comfy refused {error}")
+            await inbox.queue.put(None)
+            await send(writer, lock, TYPE_CLOSE, stream_id, b"")
+            return
+
+        async def from_comfy() -> None:
+            try:
+                while True:
+                    data = await upstream_reader.read(65536)
+                    if not data:
+                        break
+                    await send(writer, lock, TYPE_DATA, stream_id, data)
+            finally:
+                await send(writer, lock, TYPE_CLOSE, stream_id, b"")
+
+        async def to_comfy() -> None:
+            try:
+                while True:
+                    item = await inbox.queue.get()
+                    if item is None:
+                        break
+                    upstream_writer.write(item)
+                    await upstream_writer.drain()
+            finally:
+                upstream_writer.close()
+
+        await asyncio.gather(from_comfy(), to_comfy())
+        streams.pop(stream_id, None)
+
+    async def keepalive() -> None:
+        while True:
+            await asyncio.sleep(25)
+            await send(writer, lock, TYPE_PING, 0, b"")
+
+    ping = asyncio.create_task(keepalive())
+    try:
+        while True:
+            kind, stream_id, payload = await asyncio.wait_for(read_frame(reader), timeout=90)
+            if kind == TYPE_PING:
+                await send(writer, lock, TYPE_PONG, 0, payload)
+            elif kind == TYPE_OPEN:
+                streams[stream_id] = Inbox()
+                asyncio.create_task(relay(stream_id))
+            elif kind in {TYPE_DATA, TYPE_CLOSE}:
+                inbox = streams.get(stream_id)
+                if inbox is None:
+                    continue
+                await inbox.queue.put(None if kind == TYPE_CLOSE else payload)
+    finally:
+        ping.cancel()
+        writer.close()
+
+
+async def run_open(server: str, token: str, listen: int) -> None:
+    sockets: dict[int, asyncio.StreamWriter] = {}
+    tunnel_writer: asyncio.StreamWriter | None = None
+    tunnel_lock = asyncio.Lock()
+
+    async def send_frame(kind: int, stream_id: int, payload: bytes = b"") -> None:
+        if tunnel_writer is None:
+            raise ConnectionError("tunnel down")
+        await send(tunnel_writer, tunnel_lock, kind, stream_id, payload)
+
+    async def on_browser(browser_reader: asyncio.StreamReader, browser_writer: asyncio.StreamWriter) -> None:
+        if tunnel_writer is None:
+            browser_writer.close()
+            return
+        stream_id = random.randrange(1, 0x7FFFFFFF)
+        while stream_id in sockets:
+            stream_id = random.randrange(1, 0x7FFFFFFF)
+        sockets[stream_id] = browser_writer
+        try:
+            await send_frame(TYPE_OPEN, stream_id, b"")
+            while True:
+                data = await browser_reader.read(65536)
+                if not data:
+                    break
+                await send_frame(TYPE_DATA, stream_id, data)
+        except Exception:
+            pass
+        finally:
+            sockets.pop(stream_id, None)
+            try:
+                await send_frame(TYPE_CLOSE, stream_id, b"")
+            except Exception:
+                pass
+            browser_writer.close()
+
+    server_socket = await asyncio.start_server(on_browser, "127.0.0.1", listen)
+    print(f"http://localhost:{listen}", flush=True)
+
+    async def session() -> None:
+        nonlocal tunnel_writer
+        reader, writer = await connect(server, "open", token)
+        tunnel_writer = writer
+
+        async def keepalive() -> None:
+            while True:
+                await asyncio.sleep(25)
+                await send_frame(TYPE_PING, 0, b"")
+
+        ping = asyncio.create_task(keepalive())
+        try:
+            while True:
+                kind, stream_id, payload = await asyncio.wait_for(read_frame(reader), timeout=90)
+                browser = sockets.get(stream_id)
+                if kind == TYPE_PING:
+                    await send_frame(TYPE_PONG, 0, payload)
+                    continue
+                if browser is None:
+                    continue
+                if kind == TYPE_DATA:
+                    browser.write(payload)
+                    await browser.drain()
+                elif kind == TYPE_CLOSE:
+                    browser.close()
+                    sockets.pop(stream_id, None)
+        finally:
+            ping.cancel()
+            tunnel_writer = None
+            writer.close()
+            for browser in list(sockets.values()):
+                browser.close()
+            sockets.clear()
+
+    async with server_socket:
+        while True:
+            try:
+                await session()
+            except Exception as error:
+                log(f"open retry {type(error).__name__}: {error}")
+            await asyncio.sleep(3)
+
+
+def run_auth_line(auth_url: str, server: str, upstream: str) -> None:
+    status, body = http_json("POST", auth_url.rstrip("/") + "/auth/start", {"provider": "line"})
+    if status != 200 or not body or "session_id" not in body:
+        raise SystemExit(f"auth start failed: {status} {body}")
+    sid = str(body["session_id"])
+    print(f"Login Page: {body['login_url']}", flush=True)
+    log("在瀏覽器打開上面網址，用 LINE 登入。")
+    while True:
+        status, body = http_json("GET", auth_url.rstrip("/") + f"/auth/wait?sid={sid}", timeout=35)
+        if status == 204:
+            continue
+        if status != 200 or not body or not body.get("token"):
+            raise SystemExit(f"auth wait failed: {status} {body}")
+        token = str(body["token"])
+        code = str(body.get("pair_code") or "")
+        save_token(token)
+        if code:
+            print(f"./ccok {code}", flush=True)
+            log(f"連線碼 {code}（給 Mac 用）")
+        asyncio.run(run_gpu(server, token, upstream))
+        return
+
+
+def run_pair(auth_url: str, server: str, code: str, listen: int) -> None:
+    status, body = http_json("POST", auth_url.rstrip("/") + "/auth/redeem", {"code": code})
+    if status != 200 or not body or not body.get("token"):
+        raise SystemExit(f"redeem failed: {status} {body}")
+    token = str(body["token"])
+    save_token(token)
+    asyncio.run(run_open(server, token, listen))
+
+
+def main() -> None:
+    mode, listen, pair_code = parse(sys.argv[1:])
+    file_env = dotenv(ENV_PATH)
+    server = env_or_dotenv("CCOK_SERVER", file_env.get("CCOK_SERVER", DEFAULT_SERVER) or DEFAULT_SERVER)
+    auth_url = env_or_dotenv("CCOK_AUTH_URL", file_env.get("CCOK_AUTH_URL", DEFAULT_AUTH_URL) or DEFAULT_AUTH_URL)
+    try:
+        if mode == "auth_line":
+            run_auth_line(auth_url, server, f"127.0.0.1:{listen}")
+            return
+        if mode == "pair":
+            run_pair(auth_url, server, pair_code, listen)
+            return
+        token = load_token()
+        if mode == "gpu":
+            asyncio.run(run_gpu(server, token, env_or_dotenv("CCOK_UPSTREAM", "127.0.0.1:8188")))
+        else:
+            asyncio.run(run_open(server, token, listen))
+    except KeyboardInterrupt:
+        return
+
+
+if __name__ == "__main__":
+    main()
